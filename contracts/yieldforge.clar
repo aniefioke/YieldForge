@@ -149,7 +149,7 @@
 
         (map-set user-deposits 
             {user: tx-sender, protocol-id: protocol-id}
-            {amount: amount, deposit-time: block-height}
+            {amount: amount, deposit-time: stacks-block-height}
         )
         (map-set protocol-total-deposits 
             {protocol-id: protocol-id} 
@@ -175,7 +175,7 @@
                 (map-get? user-deposits {user: user, protocol-id: protocol-id}) 
                 ERR-INSUFFICIENT-FUNDS
             ))
-            (blocks-since-deposit (- block-height (get deposit-time user-deposit)))
+            (blocks-since-deposit (- stacks-block-height (get deposit-time user-deposit)))
             (annual-yield (/ 
                 (* (get base-apy protocol) (get amount user-deposit)) 
                 BASE-DENOMINATION
@@ -213,7 +213,7 @@
 
         (map-set user-deposits 
             {user: tx-sender, protocol-id: protocol-id}
-            {amount: (- (get amount user-deposit) amount), deposit-time: block-height}
+            {amount: (- (get amount user-deposit) amount), deposit-time: stacks-block-height}
         )
         (map-set protocol-total-deposits 
             {protocol-id: protocol-id} 
