@@ -80,3 +80,41 @@
 (define-private (is-valid-allocation-percentage (percentage uint))
     (and (> percentage u0) (<= percentage MAX-ALLOCATION-PERCENTAGE))
 )
+
+(define-private (is-valid-deposit-amount (amount uint))
+    (and (> amount u0) (<= amount MAX-DEPOSIT-AMOUNT))
+)
+
+;; Authorization Check
+(define-private (is-contract-owner (sender principal))
+    (is-eq sender CONTRACT-OWNER)
+)
+
+;; Protocol Management Functions
+(define-public (add-protocol 
+    (protocol-id uint) 
+    (name (string-ascii 50)) 
+    (base-apy uint) 
+    (max-allocation-percentage uint)
+)
+    (begin 
+        (asserts! (is-contract-owner tx-sender) ERR-UNAUTHORIZED)
+        (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-INPUT)
+        (asserts! (is-valid-protocol-name name) ERR-INVALID-INPUT)
+        (asserts! (is-valid-base-apy base-apy) ERR-INVALID-INPUT)
+        (asserts! (is-valid-allocation-percentage max-allocation-percentage) ERR-INVALID-INPUT)
+        (asserts! (< (var-get total-protocols) MAX-PROTOCOLS) ERR-PROTOCOL-LIMIT-REACHED)
+        
+        (map-set supported-protocols 
+            {protocol-id: protocol-id} 
+            {
+                name: name,
+                base-apy: base-apy,
+                max-allocation-percentage: max-allocation-percentage,
+                active: true
+            }
+        )
+        (var-set total-protocols (+ (var-get total-protocols) u1))
+        (ok true)
+    )
+)
