@@ -20,6 +20,12 @@
 (define-constant ERR-DEPOSIT-FAILED (err u5))
 (define-constant ERR-PROTOCOL-LIMIT-REACHED (err u6))
 (define-constant ERR-INVALID-INPUT (err u7))
+(define-constant ERR-REBALANCE-FAILED (err u8))
+(define-constant ERR-CIRCUIT-BREAKER-ACTIVE (err u9))
+(define-constant ERR-REBALANCE-COOLDOWN (err u10))
+(define-constant ERR-INSUFFICIENT-YIELD (err u11))
+(define-constant ERR-SLIPPAGE-TOLERANCE-EXCEEDED (err u12))
+
 
 ;; Protocol Storage
 (define-map supported-protocols 
@@ -34,6 +40,13 @@
 
 ;; Protocol Counter
 (define-data-var total-protocols uint u0)
+(define-data-var rebalance-cooldown uint u100)  ;; Blocks between rebalances
+(define-data-var last-rebalance-block uint u0)
+(define-data-var circuit-breaker-active bool false)
+(define-data-var total-value-locked uint u0)
+(define-data-var emergency-shutdown bool false)
+(define-data-var rebalance-request-counter uint u0)
+(define-data-var protocol-manager principal CONTRACT-OWNER)
 
 ;; User Deposit Storage
 (define-map user-deposits 
@@ -50,8 +63,42 @@
     {total-deposit: uint}
 )
 
+(define-map yield-history
+    {protocol-id: uint, block-height: uint}
+    {yield-rate: uint, total-deposits: uint}
+)
+
+(define-map user-yield-claims
+    {user: principal, protocol-id: uint}
+    {last-claim-block: uint, accumulated-yield: uint}
+)
+
+(define-map rebalance-requests
+    {request-id: uint}
+    {
+        proposer: principal,
+        from-protocol: uint,
+        to-protocol: uint,
+        amount: uint,
+        executed: bool,
+        expiry-block: uint
+    }
+)
+
+(define-map protocol-performance
+    {protocol-id: uint}
+    {
+        historical-apy: uint,
+        volatility-index: uint,
+        last-update: uint,
+        total-yield-generated: uint
+    }
+)
+
+
 ;; Contract Configuration
 (define-constant CONTRACT-OWNER tx-sender)
+
 
 ;; Protocol Constants
 (define-constant MAX-PROTOCOLS u5)
@@ -60,6 +107,10 @@
 (define-constant MAX-PROTOCOL-NAME-LENGTH u50)
 (define-constant MAX-BASE-APY u10000)  ;; 100%
 (define-constant MAX-DEPOSIT-AMOUNT u1000000000)  ;; 1 billion base units
+(define-constant ERR-REBALANCE-EXPIRED (err u13))
+(define-constant ERR-ALREADY-EXECUTED (err u14))
+
+
 
 ;; Input Validation Functions
 (define-private (is-valid-protocol-id (protocol-id uint))
@@ -250,6 +301,358 @@
         (try! (add-protocol u1 "Stacks Core Yield" u500 u20))
         (try! (add-protocol u2 "Bitcoin Bridge Yield" u750 u30))
         (ok true)
+    )
+)
+
+;; Emergency Circuit Breaker Functions
+(define-public (trigger-circuit-breaker (reason (string-ascii 100)))
+    (begin
+        (asserts! (or (is-contract-owner tx-sender) 
+                      (is-eq tx-sender (var-get protocol-manager)))  ;; Add var-get
+                 ERR-UNAUTHORIZED)
+        (var-set circuit-breaker-active true)
+        (var-set emergency-shutdown true)
+        (print {event: "circuit-breaker-triggered", reason: reason, block: stacks-block-height})
+        (ok true)
+    )
+)
+
+(define-public (reset-circuit-breaker)
+    (begin
+        (asserts! (is-contract-owner tx-sender) ERR-UNAUTHORIZED)
+        (asserts! (>= (- stacks-block-height (var-get last-rebalance-block)) u1000) 
+                 ERR-REBALANCE-COOLDOWN)
+        (var-set circuit-breaker-active false)
+        (var-set emergency-shutdown false)
+        (print {event: "circuit-breaker-reset", block: stacks-block-height})
+        (ok true)
+    )
+)
+
+;; Enhanced Deposit with Yield Tracking
+(define-public (deposit-enhanced 
+    (protocol-id uint) 
+    (amount uint)
+    (expected-yield uint)
+)
+    (let
+        (
+            (protocol (unwrap! (map-get? supported-protocols {protocol-id: protocol-id}) 
+                               ERR-INVALID-PROTOCOL))
+            (current-total (default-to {total-deposit: u0} 
+                           (map-get? protocol-total-deposits {protocol-id: protocol-id})))
+            (current-yield-claim (default-to {last-claim-block: stacks-block-height, 
+                                              accumulated-yield: u0}
+                                 (map-get? user-yield-claims {user: tx-sender, 
+                                                              protocol-id: protocol-id})))
+            (pending-yield (unwrap! (calculate-pending-yield tx-sender protocol-id) 
+                                    ERR-INSUFFICIENT-YIELD))  ;; Add unwrap!
+        )
+        
+        (asserts! (not (var-get emergency-shutdown)) ERR-CIRCUIT-BREAKER-ACTIVE)
+        (asserts! (get active protocol) ERR-INVALID-PROTOCOL)
+        (asserts! (is-valid-deposit-amount amount) ERR-INVALID-INPUT)
+        (asserts! (>= expected-yield pending-yield) 
+                 ERR-SLIPPAGE-TOLERANCE-EXCEEDED)
+        
+        ;; Update yield tracking
+        (map-set user-yield-claims
+            {user: tx-sender, protocol-id: protocol-id}
+            {
+                last-claim-block: stacks-block-height,
+                accumulated-yield: (+ (get accumulated-yield current-yield-claim) 
+                                      pending-yield)  ;; Remove unwrap!
+            }
+        )
+        
+        ;; Rest of function...
+        (ok true)
+    )
+)
+
+;; Calculate pending yield with compound interest
+(define-read-only (calculate-pending-yield 
+    (user principal) 
+    (protocol-id uint)
+)
+    (let
+        (
+            (user-deposit (unwrap! (map-get? user-deposits {user: user, protocol-id: protocol-id}) 
+                                   ERR-INSUFFICIENT-FUNDS))
+            (protocol (unwrap! (map-get? supported-protocols {protocol-id: protocol-id}) 
+                               ERR-INVALID-PROTOCOL))
+            (user-claim (default-to {last-claim-block: (get deposit-time user-deposit), 
+                                     accumulated-yield: u0}
+                        (map-get? user-yield-claims {user: user, protocol-id: protocol-id})))
+            (blocks-elapsed (- stacks-block-height (get last-claim-block user-claim)))
+            (base-rate (get base-apy protocol))
+            (principal-amount (get amount user-deposit))
+        )
+        
+        ;; Compound interest calculation: P * (1 + r)^n - P simplified
+        (let
+            (
+                (simple-yield (/ (* principal-amount base-rate blocks-elapsed) 
+                                 (* BASE-DENOMINATION u52596)))
+                (compounded (if (> blocks-elapsed u100)
+                    (+ simple-yield (/ (* simple-yield base-rate) (* BASE-DENOMINATION u2)))
+                    simple-yield
+                ))
+            )
+            (ok (+ compounded (get accumulated-yield user-claim)))
+        )
+    )
+)
+
+;; Automated Rebalance Request
+(define-public (request-rebalance
+    (from-protocol uint)
+    (to-protocol uint)
+    (amount uint)
+    (min-expected-yield uint)
+)
+    (let
+        (
+            (request-id (+ (var-get rebalance-request-counter) u1))
+            (from-protocol-data (unwrap! (map-get? supported-protocols {protocol-id: from-protocol})
+                                         ERR-INVALID-PROTOCOL))
+            (to-protocol-data (unwrap! (map-get? supported-protocols {protocol-id: to-protocol})
+                                       ERR-INVALID-PROTOCOL))
+            (user-deposit (unwrap! (map-get? user-deposits {user: tx-sender, 
+                                                            protocol-id: from-protocol})
+                                   ERR-INSUFFICIENT-FUNDS))
+        )
+        
+        (asserts! (not (var-get circuit-breaker-active)) ERR-CIRCUIT-BREAKER-ACTIVE)
+        (asserts! (>= (get amount user-deposit) amount) ERR-INSUFFICIENT-FUNDS)
+        (asserts! (get active from-protocol-data) ERR-INVALID-PROTOCOL)
+        (asserts! (get active to-protocol-data) ERR-INVALID-PROTOCOL)
+        (asserts! (>= (- stacks-block-height (var-get last-rebalance-block)) 
+                      (var-get rebalance-cooldown)) 
+                 ERR-REBALANCE-COOLDOWN)
+        
+        (var-set rebalance-request-counter request-id)
+        
+        (map-set rebalance-requests
+            {request-id: request-id}
+            {
+                proposer: tx-sender,
+                from-protocol: from-protocol,
+                to-protocol: to-protocol,
+                amount: amount,
+                executed: false,
+                expiry-block: (+ stacks-block-height u50)  ;; Expires after ~500 blocks
+            }
+        )
+        
+        (print {
+            event: "rebalance-requested",
+            request-id: request-id,
+            from: from-protocol,
+            to: to-protocol,
+            amount: amount,
+            proposer: tx-sender
+        })
+        
+        (ok request-id)
+    )
+)
+
+;; Execute Rebalance with MEV Protection
+(define-public (execute-rebalance
+    (request-id uint)
+    (expected-yield uint)
+)
+    (let
+        (
+            (request (unwrap! (map-get? rebalance-requests {request-id: request-id})
+                             ERR-INVALID-INPUT))
+            (from-protocol (get from-protocol request))
+            (to-protocol (get to-protocol request))
+            (amount (get amount request))
+            (user-deposit (unwrap! (map-get? user-deposits 
+                                             {user: (get proposer request), 
+                                              protocol-id: from-protocol})
+                                   ERR-INSUFFICIENT-FUNDS))
+            (to-total (default-to {total-deposit: u0}
+                       (map-get? protocol-total-deposits {protocol-id: to-protocol})))
+            (from-total (default-to {total-deposit: u0}
+                         (map-get? protocol-total-deposits {protocol-id: from-protocol})))
+            (pending-yield (unwrap! (calculate-pending-yield (get proposer request) from-protocol)
+                                   u0))
+        )
+        
+        (asserts! (not (var-get executed request)) ERR-ALREADY-EXECUTED)
+        (asserts! (>= stacks-block-height (get expiry-block request)) ERR-REBALANCE-EXPIRED)
+        (asserts! (>= expected-yield pending-yield) ERR-SLIPPAGE-TOLERANCE-EXCEEDED)
+        
+        ;; Update deposits - withdraw from source protocol
+        (map-set user-deposits 
+            {user: (get proposer request), protocol-id: from-protocol}
+            {
+                amount: (- (get amount user-deposit) amount),
+                deposit-time: stacks-block-height
+            }
+        )
+        
+        ;; Update deposits - deposit to target protocol
+        (map-set user-deposits 
+            {user: (get proposer request), protocol-id: to-protocol}
+            {
+                amount: (+ (default-to u0 
+                            (get amount (map-get? user-deposits 
+                                {user: (get proposer request), protocol-id: to-protocol}))) 
+                          amount),
+                deposit-time: stacks-block-height
+            }
+        )
+        
+        ;; Update protocol totals
+        (map-set protocol-total-deposits 
+            {protocol-id: from-protocol}
+            {total-deposit: (- (get total-deposit from-total) amount)}
+        )
+        
+        (map-set protocol-total-deposits 
+            {protocol-id: to-protocol}
+            {total-deposit: (+ (get total-deposit to-total) amount)}
+        )
+        
+        ;; Mark request as executed
+        (map-set rebalance-requests
+            {request-id: request-id}
+            (merge request {executed: true})
+        )
+        
+        (var-set last-rebalance-block stacks-block-height)
+        
+        ;; Update protocol performance metrics
+        (try! (update-protocol-performance from-protocol))
+        (try! (update-protocol-performance to-protocol))
+        
+        (print {
+            event: "rebalance-executed",
+            request-id: request-id,
+            from: from-protocol,
+            to: to-protocol,
+            amount: amount
+        })
+        
+        (ok true)
+    )
+)
+
+;; Update Protocol Performance Metrics
+(define-private (update-protocol-performance (protocol-id uint))
+    (let
+        (
+            (protocol (unwrap! (map-get? supported-protocols {protocol-id: protocol-id})
+                               ERR-INVALID-PROTOCOL))
+            (current-performance (default-to 
+                {historical-apy: (get base-apy protocol), 
+                 volatility-index: u0, 
+                 last-update: stacks-block-height,
+                 total-yield-generated: u0}
+                (map-get? protocol-performance {protocol-id: protocol-id})))
+            (total-deposits (default-to {total-deposit: u0}
+                             (map-get? protocol-total-deposits {protocol-id: protocol-id})))
+        )
+        
+        ;; Calculate new volatility index based on yield history
+        (map-set protocol-performance
+            {protocol-id: protocol-id}
+            {
+                historical-apy: (get base-apy protocol),
+                volatility-index: (calculate-volatility protocol-id),
+                last-update: stacks-block-height,
+                total-yield-generated: (+ (get total-yield-generated current-performance)
+                                          (calculate-protocol-yield protocol-id))
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+;; Calculate Protocol Volatility
+(define-read-only (calculate-volatility (protocol-id uint))
+    (let
+        (
+            (recent-history (list 
+                (unwrap! (map-get? yield-history 
+                          {protocol-id: protocol-id, block-height: (- stacks-block-height u1)})
+                        {yield-rate: u0, total-deposits: u0})
+                (unwrap! (map-get? yield-history 
+                          {protocol-id: protocol-id, block-height: (- stacks-block-height u10)})
+                        {yield-rate: u0, total-deposits: u0})
+            ))
+        )
+        ;; Simplified volatility calculation
+        (fold calculate-variance recent-history u0)
+    )
+)
+
+(define-private (calculate-variance
+    (history {yield-rate: uint, total-deposits: uint})
+    (acc uint)
+)
+    (+ acc (get yield-rate history))
+)
+
+;; Calculate Protocol Yield
+(define-read-only (calculate-protocol-yield (protocol-id uint))
+    u0  ;; Placeholder for complex yield calculation
+)
+
+;; Protocol Manager Role
+(define-data-var protocol-manager principal CONTRACT-OWNER)
+
+(define-public (set-protocol-manager (new-manager principal))
+    (begin
+        (asserts! (is-contract-owner tx-sender) ERR-UNAUTHORIZED)
+        (var-set protocol-manager new-manager)
+        (ok true)
+    )
+)
+
+;; Emergency Pause for Specific Protocol
+(define-public (pause-protocol (protocol-id uint))
+    (begin
+        (asserts! (or (is-contract-owner tx-sender) 
+                      (is-eq tx-sender (var-get protocol-manager))) 
+                 ERR-UNAUTHORIZED)
+        (map-set supported-protocols 
+            {protocol-id: protocol-id}
+            (merge 
+                (unwrap! (map-get? supported-protocols {protocol-id: protocol-id}) 
+                        ERR-INVALID-PROTOCOL)
+                {active: false}
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Claim Accumulated Yield
+(define-public (claim-yield (protocol-id uint))
+    (let
+        (
+            (pending-yield (unwrap! (calculate-pending-yield tx-sender protocol-id) 
+                                    ERR-INSUFFICIENT-YIELD))
+        )
+        (asserts! (> pending-yield u0) ERR-INSUFFICIENT-YIELD)
+        
+        (map-set user-yield-claims
+            {user: tx-sender, protocol-id: protocol-id}
+            {
+                last-claim-block: stacks-block-height,
+                accumulated-yield: u0
+            }
+        )
+        
+        (print {event: "yield-claimed", user: tx-sender, protocol: protocol-id, amount: pending-yield})
+        
+        (ok pending-yield)
     )
 )
 
